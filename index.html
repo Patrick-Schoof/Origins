@@ -1595,25 +1595,20 @@ function playerPickPool(idx){
   if(GS.phase!=='pool-select')return;
   const rawPool=GS.pools[idx];
   if(!rawPool)return;
-  if(GS.mpMode){
-    // Apply energy locally immediately so player can queue abilities
-    const pool=Array.isArray(rawPool)?rawPool:Object.values(rawPool);
-    for(const o of pool)GS.pEnergy[o]++;
-    addLog('You gain: '+pool.join(', ')+' energy','p');
-    GS.pools[idx]=null;
-    GS.phase='acting';
-    // Signal pick to Firebase in background — opponent picks in parallel
-    const field=MP.role==='host'?'hostPoolPick':'guestPoolPick';
-    MP.battleRef.update({[field]:idx});
-    mpHideWaitBanner();
-    render();
+  if(GS.mpMode&&MP.role==='guest'){
+    mpGuestPickPool(idx);
     return;
   }
+  // Host (MP) or solo: apply energy locally
   const pool=Array.isArray(rawPool)?rawPool:Object.values(rawPool);
   for(const o of pool)GS.pEnergy[o]++;
-  addLog(`You gain: ${pool.join(', ')} energy`,'p');
+  addLog('You gain: '+pool.join(', ')+' energy','p');
   GS.pools[idx]=null;
   GS.phase='acting';
+  if(GS.mpMode){
+    // Host: signal pool pick to Firebase for guest's display
+    MP.battleRef.update({phase:'acting',poolPick:idx});
+  }
   render();
 }
 
@@ -3877,8 +3872,15 @@ async function mpConfirmTeam(){
 
 // ── Battle: Host Initialization ───────────────────────────────────────
 
+// ══════════════════════════════════════════════════════════════════════
+// MP BATTLE — Sequential turn model
+// activeRole = 'host' | 'guest' — only that player can act
+// Flow: pool-pick → acting → host resolves → flip activeRole → repeat
+// Host always resolves. Guest always reads state from Firebase.
+// ══════════════════════════════════════════════════════════════════════
+
 async function mpHostInitBattle(hostTeamIds,guestTeamIds){
-  console.log('[MP] Host: mpHostInitBattle called');
+  console.log('[MP] Host: init battle');
   mpCleanup();
   const hostFirst=Math.random()<0.5;
   GS={
@@ -3888,133 +3890,289 @@ async function mpHostInitBattle(hostTeamIds,guestTeamIds){
     pools:makePools(),browseChar:null,staging:null,actionQueue:[],
     phase:'pool-select',log:[],pFallen:0,aFallen:0,
     veteransInstinctUsed:{},overclockUses:{},lastAbilUsed:{},
-    aiProfile:null,mpMode:true,mpRole:'host',_guestPoolApplied:false,
+    aiProfile:null,mpMode:true,mpRole:'host',
   };
   addLog('The battle begins!','info');
   addLog((hostFirst?MP.myName:MP.oppName)+' has initiative!',hostFirst?'p':'e');
-
   MP.battleRef=MP.roomRef.child('battle');
-  const initBattle={
-    turn:1,hostFirst,phase:'pool-pick',
+
+  const initData={
+    turn:1,
+    activeRole:hostFirst?'host':'guest',
+    phase:'pool-pick',
     pools:GS.pools,
-    hostPoolPick:-1,guestPoolPick:-1,
-    hostActionReady:false,guestActionReady:false,
-    hostAction:null,guestAction:null,
-    stateVer:0,state:mpSerializeGS(),
+    poolPick:-1,
+    action:{skip:true},
+    actionReady:false,
+    state:mpSerializeGS(),
   };
-  // Write battle data FIRST, then signal guest by updating status
-  console.log('[MP] Host: writing battle data to Firebase...');
-  await MP.battleRef.set(initBattle);
-  console.log('[MP] Host: battle data written, signaling guest...');
+  await MP.battleRef.set(initData);
   await MP.roomRef.update({status:'battle'});
-  console.log('[MP] Host: status set to battle');
+  console.log('[MP] Host: battle data written');
 
   showScreen('battle');
   mpUpdateBattleHeader();
-  if(!hostFirst){
+  if(hostFirst){
+    GS.phase='pool-select';
+    mpHideWaitBanner();
+  }else{
     GS.phase='waiting-mp';
-    mpShowWaitBanner('⏳ '+MP.oppName+' picks energy first...');
+    mpShowWaitBanner('⏳ '+MP.oppName+"'s turn first...");
   }
   render();
-  mpHostListenBattle();
+  mpHostListen();
 }
 
-function mpHostListenBattle(){
+function mpHostListen(){
   mpListen(MP.battleRef,'value',snap=>{
     const d=snap.val();if(!d)return;
-    console.log('[MP] Host listener: phase='+d.phase+' hostReady='+d.hostActionReady+' guestReady='+d.guestActionReady+' mpHostWaiting='+GS.mpHostWaiting);
-    // Handle guest pool pick
-    if(d.phase==='pool-pick'&&d.guestPoolPick>=0&&d.hostPoolPick>=0){
-      mpHostBothPoolsPicked(d);
-    }
-    // Handle both actions submitted — check guestActionReady and hostActionReady
-    if(d.guestActionReady&&d.hostActionReady&&GS.mpHostWaiting){
-      GS.mpHostWaiting=false;
-      console.log('[MP] Host: both actions ready, resolving...');
-      mpHostBothActed(d.guestAction);
+    console.log('[MP] Host rcv: phase='+d.phase+' activeRole='+d.activeRole+' actionReady='+d.actionReady);
+
+    // Guest submitted their action — resolve it
+    if(d.activeRole==='guest'&&d.actionReady&&d.phase==='acting'){
+      mpHostResolveGuestTurn(d);
     }
   });
 }
 
-function mpHostBothPoolsPicked(d){
-  // Host already applied their own energy locally when they picked
-  // Just apply guest energy and write acting state for guest to read
+async function mpHostResolveGuestTurn(d){
+  // Prevent double-fire
+  if(GS._resolving)return;
+  GS._resolving=true;
+
+  // Apply guest energy from their pool pick
   const allPools=fbArr(d.pools).map(p=>p?fbArr(p):null);
-  const gPool=allPools[d.guestPoolPick]||[];
-  // Only apply guest energy if not already done (run once guard)
-  if(GS._guestPoolApplied)return;
-  GS._guestPoolApplied=true;
+  const gPool=allPools[d.poolPick]||[];
   gPool.forEach(o=>{GS.aEnergy[o]=(GS.aEnergy[o]||0)+1;});
-  addLog(MP.oppName+' picks energy.','e');
-  // Write acting state so guest can queue actions
-  MP.battleRef.update({phase:'acting',state:mpSerializeGS()});
-  render();
-}
+  addLog(MP.oppName+' gains energy.','e');
 
-async function mpHostBothActed(guestAction){
-  GS.phase='resolving-mp';
-  mpHideWaitBanner();
-  render();
-  addLog('── Round resolving ──','info');
-
-  // Determine order
-  const hostFirst=GS.playerFirst;
-
-  if(hostFirst){
-    await mpResolveHostActions();
-    if(GS.phase==='game-over-mp')return;
-    await mpResolveGuestAction(guestAction);
+  // Resolve guest action
+  const qa=d.action;
+  if(qa&&!qa.skip){
+    const caster=GS.aTeam[qa.charIdx];
+    if(caster&&alive(caster)&&!hasStatus(caster,'stun')){
+      const ab=CHARS[caster.charId].abilities.find(a=>a.id===qa.abilId);
+      if(ab){
+        const targets=mpResolveTargets(ab,fbArr(qa.targetIdxs),GS.aTeam,GS.pTeam,caster);
+        if(targets!==null&&canAfford(GS.aEnergy,ab.cost)){
+          const fakeQa={charIdx:qa.charIdx,abilId:qa.abilId,targetIdxs:fbArr(qa.targetIdxs)};
+          await animateAction(fakeQa,'enemy');
+          resolveAbility(qa.abilId,caster,targets,GS.aEnergy,GS.pEnergy,fbArr(qa.anyChoices||[]));
+          render();await sleep(320);
+        }
+      }
+    }
   }else{
-    await mpResolveGuestAction(guestAction);
-    if(GS.phase==='game-over-mp')return;
-    await mpResolveHostActions();
+    addLog(MP.oppName+' skips their action.','e');
   }
-  if(GS.phase==='game-over-mp')return;
 
-  await sleep(200);
+  if(!living(GS.pTeam).length){await mpHostEndGame('guest');GS._resolving=false;return;}
+  if(!living(GS.aTeam).length){await mpHostEndGame('host');GS._resolving=false;return;}
+
   addLog('── End of round ──','info');
   tickTeam(GS.pTeam);tickTeam(GS.aTeam);
-  if(!living(GS.pTeam).length){await mpHostEndGame('guest');return;}
-  if(!living(GS.aTeam).length){await mpHostEndGame('host');return;}
-  await mpHostStartNextRound();
+  if(!living(GS.pTeam).length){await mpHostEndGame('guest');GS._resolving=false;return;}
+  if(!living(GS.aTeam).length){await mpHostEndGame('host');GS._resolving=false;return;}
+
+  // Start next round — host goes first
+  await mpHostStartRound('host');
+  GS._resolving=false;
 }
 
-async function mpResolveHostActions(){
+async function mpHostResolveHostTurn(){
+  // Called after host ends their turn
+  addLog('── Resolving your turn ──','info');
+  GS.phase='waiting-mp';render();
+
   const queue=[...GS.actionQueue];
   GS.actionQueue=[];
   for(const qa of queue){
     const caster=GS.pTeam[qa.charIdx];
-    if(!caster||!alive(caster)){addLog((CHARS[GS.pTeam[qa.charIdx]?.charId]?.name||'Ally')+' was defeated — skipped','info');continue;}
-    if(hasStatus(caster,'stun')){addLog(CHARS[caster.charId].name+' is stunned — skipped!','info');render();await sleep(300);continue;}
+    if(!caster||!alive(caster)){addLog('Ally defeated — skipped','info');continue;}
+    if(hasStatus(caster,'stun')){addLog(CHARS[caster.charId].name+' stunned — skipped','info');render();await sleep(300);continue;}
     const ab=CHARS[caster.charId].abilities.find(a=>a.id===qa.abilId);
     if(!ab)continue;
     const targets=mpResolveTargets(ab,qa.targetIdxs,GS.pTeam,GS.aTeam,caster);
-    if(targets===null){addLog(CHARS[caster.charId].name+"'s target unavailable \u2014 skipped",'info');render();await sleep(300);continue;}
-    if(!canAfford(GS.pEnergy,ab.cost)){addLog(CHARS[caster.charId].name+': not enough energy \u2014 skipped','info');render();await sleep(300);continue;}
+    if(targets===null){addLog(CHARS[caster.charId].name+"'s target unavailable — skipped",'info');render();await sleep(300);continue;}
+    if(!canAfford(GS.pEnergy,ab.cost)){addLog(CHARS[caster.charId].name+': not enough energy — skipped','info');render();await sleep(300);continue;}
     await animateAction(qa,'player');
-    resolveAbility(qa.abilId,caster,targets,GS.pEnergy,GS.aEnergy,qa.anyChoices);
+    resolveAbility(qa.abilId,caster,targets,GS.pEnergy,GS.aEnergy,qa.anyChoices||[]);
     render();await sleep(320);
     if(!living(GS.aTeam).length){await mpHostEndGame('host');return;}
   }
+
+  if(!living(GS.pTeam).length){await mpHostEndGame('guest');return;}
+
+  // Hand off to guest
+  await mpHostStartRound('guest');
 }
 
-async function mpResolveGuestAction(qa){
-  if(!qa||qa.skip)return;
-  const caster=GS.aTeam[qa.charIdx];
-  if(!caster||!alive(caster)){addLog(MP.oppName+"'s fighter was defeated \u2014 skipped",'info');render();await sleep(300);return;}
-  if(hasStatus(caster,'stun')){addLog(CHARS[caster.charId].name+' is stunned — skipped!','info');render();await sleep(300);return;}
-  const ab=CHARS[caster.charId].abilities.find(a=>a.id===qa.abilId);
-  if(!ab)return;
-  // For guest action: myTeam=aTeam, oppTeam=pTeam
-  const targets=mpResolveTargets(ab,qa.targetIdxs,GS.aTeam,GS.pTeam,caster);
-  if(targets===null){addLog(MP.oppName+"'s target unavailable \u2014 skipped",'info');render();await sleep(300);return;}
-  if(!canAfford(GS.aEnergy,ab.cost)){addLog(CHARS[caster.charId].name+': not enough energy \u2014 skipped','info');render();await sleep(300);return;}
-  const fakeQa={charIdx:qa.charIdx,abilId:qa.abilId,targetIdxs:qa.targetIdxs};
-  await animateAction(fakeQa,'enemy');
-  resolveAbility(qa.abilId,caster,targets,GS.aEnergy,GS.pEnergy,qa.anyChoices);
-  render();await sleep(320);
-  if(!living(GS.pTeam).length){await mpHostEndGame('guest');return;}
+async function mpHostStartRound(activeRole){
+  GS.turn++;
+  GS.pools=makePools();
+  GS.pEnergy=emptyE();
+  GS.aEnergy=emptyE();
+  GS.staging=null;GS.actionQueue=[];
+  const newRound={
+    turn:GS.turn,
+    activeRole,
+    phase:'pool-pick',
+    pools:GS.pools,
+    poolPick:-1,
+    action:{skip:true},
+    actionReady:false,
+    state:mpSerializeGS(),
+  };
+  await MP.battleRef.update(newRound);
+  if(activeRole==='host'){
+    GS.phase='pool-select';
+    mpHideWaitBanner();
+  }else{
+    GS.phase='waiting-mp';
+    mpShowWaitBanner('⏳ '+MP.oppName+"'s turn...");
+  }
+  render();
 }
+
+async function mpHostEndGame(winner){
+  GS.phase='game-over-mp';
+  const state=mpSerializeGS();
+  state.winner=winner;
+  await MP.battleRef.update({phase:'done',state});
+  mpCleanup();
+  endGame(winner==='host'?'player':'ai');
+}
+
+// ── Guest ─────────────────────────────────────────────────────────────
+
+function mpGuestWatchBattle(){
+  console.log('[MP] Guest: watching battle');
+  mpCleanup();
+  GS={
+    turn:1,playerFirst:false,playerGetsFreePick:false,
+    pTeam:[],aTeam:[],pEnergy:emptyE(),aEnergy:emptyE(),
+    pools:[],browseChar:null,staging:null,actionQueue:[],
+    phase:'waiting-mp',log:[],pFallen:0,aFallen:0,
+    veteransInstinctUsed:{},overclockUses:{},lastAbilUsed:{},
+    aiProfile:null,mpMode:true,mpRole:'guest',
+  };
+  MP.battleRef=MP.roomRef.child('battle');
+  showScreen('battle');
+  mpUpdateBattleHeader();
+  mpShowWaitBanner('⏳ Connecting...');
+  render();
+  mpListen(MP.battleRef,'value',snap=>{
+    const d=snap.val();if(!d)return;
+    console.log('[MP] Guest rcv: phase='+d.phase+' activeRole='+d.activeRole);
+    mpGuestHandleUpdate(d);
+  });
+}
+
+function mpGuestHandleUpdate(d){
+  if(!d||!d.state){mpShowWaitBanner('⏳ Connecting...');return;}
+  const s=d.state;
+
+  if(s.winner==='host'){mpCleanup();endGame('ai');return;}
+  if(s.winner==='guest'){mpCleanup();endGame('player');return;}
+
+  // Apply authoritative state from host
+  // Guest = aTeam from host's perspective
+  try{
+    GS.pTeam=fbArr(s.aTeam).map(fbCharFromFB);
+    GS.aTeam=fbArr(s.pTeam).map(fbCharFromFB);
+  }catch(e){console.error('[MP] team parse error',e);return;}
+  GS.pEnergy={...s.aEnergy};
+  GS.aEnergy={...s.pEnergy};
+  GS.pFallen=s.aFallen||0;GS.aFallen=s.pFallen||0;
+  GS.turn=d.turn||1;
+  GS.log=fbArr(s.log||[]);
+  GS.playerFirst=d.activeRole==='guest'; // guest has initiative when it's their turn
+  GS.pools=fbArr(d.pools||[]).map(p=>p?fbArr(p):null);
+  GS.veteransInstinctUsed={...(s.veteransInstinctUsed||{})};
+  GS.overclockUses={...(s.overclockUses||{})};
+  GS.lastAbilUsed={...(s.lastAbilUsed||{})};
+
+  if(d.phase==='done'){
+    render();return;
+  }
+
+  if(d.activeRole==='guest'){
+    // It's the guest's turn
+    if(d.phase==='pool-pick'&&!d.actionReady){
+      GS.phase='pool-select';
+      mpHideWaitBanner();
+    }else if(d.phase==='acting'&&!d.actionReady){
+      GS.phase='acting';
+      mpHideWaitBanner();
+    }else{
+      GS.phase='waiting-mp';
+      mpShowWaitBanner('⏳ Waiting for resolution...');
+    }
+  }else{
+    // Host's turn — guest waits
+    GS.phase='waiting-mp';
+    mpShowWaitBanner('⏳ '+MP.oppName+"'s turn...");
+  }
+  render();
+}
+
+// ── Shared: End Turn ──────────────────────────────────────────────────
+
+async function mpEndTurn(){
+  if(GS.phase!=='acting')return;
+  GS.staging=null;
+
+  // Handle any-cost prompt
+  let anyChoices=[];
+  const qa=GS.actionQueue[0];
+  if(qa){
+    const ab=CHARS[GS.pTeam[qa.charIdx].charId].abilities.find(a=>a.id===qa.abilId);
+    if(ab&&(ab.cost.any||0)>0){
+      const snapE=Object.fromEntries(ORIGINS.map(o=>[o,GS.pEnergy[o]||0]));
+      const choiceMap=await anyEnergyPrompt([qa],snapE);
+      anyChoices=choiceMap.get(0)||[];
+    }
+  }
+
+  const action=qa
+    ?{charIdx:qa.charIdx,abilId:qa.abilId,targetIdxs:qa.targetIdxs,anyChoices}
+    :{skip:true};
+  console.log('[MP] '+MP.role+': ending turn, action=',action);
+
+  if(MP.role==='host'){
+    // Host resolves their own turn locally then hands off
+    GS.actionQueue=qa?[{...qa,anyChoices}]:[];
+    await mpHostResolveHostTurn();
+  }else{
+    // Guest: write action to Firebase, host will resolve
+    await MP.battleRef.update({
+      phase:'acting',
+      action,
+      actionReady:true,
+    });
+    GS.phase='waiting-mp';
+    GS.actionQueue=[];
+    mpShowWaitBanner('⏳ Waiting for resolution...');
+    render();
+  }
+}
+
+// ── Pool pick in MP ───────────────────────────────────────────────────
+
+function mpGuestPickPool(idx){
+  // Guest picks pool: apply energy locally, signal Firebase, move to acting
+  const rawPool=GS.pools[idx];if(!rawPool)return;
+  const pool=Array.isArray(rawPool)?rawPool:Object.values(rawPool);
+  pool.forEach(o=>{GS.pEnergy[o]=(GS.pEnergy[o]||0)+1;});
+  addLog('You gain: '+pool.join(', ')+' energy','p');
+  GS.pools[idx]=null;
+  GS.phase='acting';
+  MP.battleRef.update({phase:'acting',poolPick:idx});
+  mpHideWaitBanner();
+  render();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
 
 function mpResolveTargets(ab,targetIdxs,myTeam,oppTeam,caster){
   if(ab.targeting==='self')return[caster];
@@ -4031,171 +4189,6 @@ function mpResolveTargets(ab,targetIdxs,myTeam,oppTeam,caster){
   if(!t||!alive(t))return null;
   if(hasStatus(t,'untarget'))return null;
   return[t];
-}
-
-async function mpHostStartNextRound(){
-  GS.turn++;GS.pools=makePools();GS.staging=null;GS.actionQueue=[];
-  GS._guestPoolApplied=false;
-  const newRound={
-    turn:GS.turn,hostFirst:GS.playerFirst,phase:'pool-pick',
-    pools:GS.pools,
-    hostPoolPick:-1,guestPoolPick:-1,
-    hostActionReady:false,guestActionReady:false,
-    hostAction:{skip:true},guestAction:{skip:true},
-    stateVer:(Date.now()),state:mpSerializeGS(),
-  };
-  await MP.battleRef.update(newRound);
-  GS.phase=GS.playerFirst?'pool-select':'waiting-mp';
-  if(!GS.playerFirst)mpShowWaitBanner('⏳ '+MP.oppName+' picks energy...');
-  else mpHideWaitBanner();
-  render();
-}
-
-async function mpHostEndGame(winner){
-  GS.phase='game-over-mp';
-  const state=mpSerializeGS();
-  state.winner=winner;
-  await MP.battleRef.update({phase:'done',state});
-  mpCleanup();
-  endGame(winner==='host'?'player':'ai');
-}
-
-// ── Battle: Guest ─────────────────────────────────────────────────────
-
-
-// Firebase returns arrays as objects {0:{},1:{},2:{}} — this converts them back safely
-function fbArr(x){if(!x)return[];if(Array.isArray(x))return x;return Object.values(x);}
-function fbCharFromFB(c){
-  return{
-    ...c,
-    statuses:fbArr(c.statuses).map(s=>({...s})),
-    cooldowns:{...(c.cooldowns||{})},
-  };
-}
-function mpGuestWatchBattle(){
-  console.log('[MP] Guest: mpGuestWatchBattle called, room='+MP.roomCode);
-  mpCleanup();
-  GS={
-    turn:1,playerFirst:false,playerGetsFreePick:false,
-    pTeam:[],aTeam:[],pEnergy:emptyE(),aEnergy:emptyE(),
-    pools:[],browseChar:null,staging:null,actionQueue:[],
-    phase:'waiting-mp',log:[],pFallen:0,aFallen:0,
-    veteransInstinctUsed:{},overclockUses:{},lastAbilUsed:{},
-    aiProfile:null,mpMode:true,mpRole:'guest',
-  };
-  MP.battleRef=MP.roomRef.child('battle');
-  showScreen('battle');
-  mpUpdateBattleHeader();
-  mpShowWaitBanner('⏳ Connecting to battle...');
-  render();
-  mpListen(MP.battleRef,'value',snap=>{
-    const d=snap.val();if(!d)return;
-    mpGuestHandleUpdate(d);
-  });
-}
-
-function mpGuestHandleUpdate(d){
-  console.log('[MP] Guest: update received, phase='+(d&&d.phase)+' hasState='+!!(d&&d.state));
-  if(!d){return;}
-  if(!d.state){
-    // State not ready yet — show connecting message and wait
-    mpShowWaitBanner('⏳ Connecting to battle...');
-    return;
-  }
-  const s=d.state;
-  if(s.winner==='host'){mpCleanup();endGame('ai');return;}
-  if(s.winner==='guest'){mpCleanup();endGame('player');return;}
-
-  // Apply state — guest sees aTeam as pTeam (their team at bottom)
-  // fbArr/fbCharFromFB: Firebase stores arrays as objects, convert back
-  try{
-    GS.pTeam=fbArr(s.aTeam).map(fbCharFromFB);
-    GS.aTeam=fbArr(s.pTeam).map(fbCharFromFB);
-  }catch(e){console.error('[MP] team parse error',e,s);return;}
-  GS.pEnergy={...s.aEnergy};GS.aEnergy={...s.pEnergy};
-  GS.pFallen=s.aFallen||0;GS.aFallen=s.pFallen||0;
-  GS.turn=s.turn||d.turn||GS.turn;
-  GS.log=fbArr(s.log||[]);
-  GS.playerFirst=!d.hostFirst;
-  GS.pools=fbArr(d.pools||[]).map(p=>p?fbArr(p):null);
-  GS.veteransInstinctUsed={...(s.veteransInstinctUsed||{})};
-  GS.overclockUses={...(s.overclockUses||{})};
-  GS.lastAbilUsed={...(s.lastAbilUsed||{})};
-
-  switch(d.phase){
-    case'pool-pick':
-      // Guest picks energy locally (same as host) — no waiting needed
-      // If guest hasn't picked yet, show pool select
-      if(d.guestPoolPick<0){
-        GS.phase='pool-select';
-        GS.pools=fbArr(d.pools).map(p=>p?fbArr(p):null);
-        mpHideWaitBanner();
-      }else if(GS.phase!=='acting'){
-        // Guest already picked but host hasn't resolved yet — stay in acting
-        // (guest applied energy locally already)
-        GS.phase='acting';
-        mpHideWaitBanner();
-      }
-      break;
-    case'acting':
-      if(d.guestActionReady){
-        GS.phase='waiting-mp';
-        mpShowWaitBanner('⏳ Waiting for '+MP.oppName+' to act...');
-      }else{
-        GS.phase='acting';
-        if(GS.actionQueue.length===0)GS.staging=null;
-        mpHideWaitBanner();
-      }
-      break;
-    case'resolving':
-    case'done':
-      GS.phase='waiting-mp';
-      mpShowWaitBanner(d.phase==='resolving'?'⚡ Resolving...':(s.winner?'':'Done'));
-      break;
-  }
-  render();
-}
-
-// ── MP endTurn (both roles) ───────────────────────────────────────────
-
-async function mpEndTurn(){
-  if(GS.phase!=='acting')return;
-  GS.staging=null;
-  if(!GS.actionQueue.length){addLog('Nothing queued — skipping turn','info');GS.actionQueue=[];}
-
-  // Handle any-cost prompt
-  let anyChoices=[];
-  const qa=GS.actionQueue[0];
-  if(qa){
-    const ab=CHARS[GS.pTeam[qa.charIdx].charId].abilities.find(a=>a.id===qa.abilId);
-    if(ab&&(ab.cost.any||0)>0){
-      const snapE=Object.fromEntries(ORIGINS.map(o=>[o,GS.pEnergy[o]||0]));
-      const choiceMap=await anyEnergyPrompt([qa],snapE);
-      anyChoices=choiceMap.get(0)||[];
-    }
-  }
-
-  // Use sentinel {skip:true} instead of null — Firebase drops null values
-  const action=qa?{charIdx:qa.charIdx,abilId:qa.abilId,targetIdxs:qa.targetIdxs,anyChoices}:{skip:true};
-  const role=MP.role;
-  const readyField=role==='host'?'hostActionReady':'guestActionReady';
-  const actionField=role==='host'?'hostAction':'guestAction';
-
-  const upd={[readyField]:true,[actionField]:action};
-  await MP.battleRef.update(upd);
-  console.log('[MP] '+role+': submitted action',action);
-
-  GS.phase='waiting-mp';
-  GS.actionQueue=[];
-  GS.staging=null;
-  mpShowWaitBanner('⏳ Waiting for '+MP.oppName+'...');
-  render();
-
-  if(role==='host'){
-    // Host waits for guest action
-    GS.mpHostWaiting=true;
-  }
-  // Guest just waits for host to write new state (handled by mpGuestHandleUpdate)
 }
 
 // ── Shared Utilities ──────────────────────────────────────────────────
