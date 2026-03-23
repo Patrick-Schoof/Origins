@@ -1592,7 +1592,9 @@ function playerPickFreeOrigin(origin){
 }
 
 function playerPickPool(idx){
-  if(GS.phase!=='pool-select'||!GS.pools[idx])return;
+  if(GS.phase!=='pool-select')return;
+  const rawPool=GS.pools[idx];
+  if(!rawPool)return;
   if(GS.mpMode){
     // In MP mode: just signal the pick, don't apply energy locally
     // Host resolves both picks and writes authoritative state
@@ -1603,7 +1605,7 @@ function playerPickPool(idx){
     render();
     return;
   }
-  const pool=GS.pools[idx];
+  const pool=Array.isArray(rawPool)?rawPool:Object.values(rawPool);
   for(const o of pool)GS.pEnergy[o]++;
   addLog(`You gain: ${pool.join(', ')} energy`,'p');
   GS.pools[idx]=null;
@@ -2540,9 +2542,10 @@ function render(){
   // Pools
   const poolsLocked=ph!=='pool-select';
   document.getElementById('pools-label').textContent=poolsLocked?'ENERGY POOLS':'ENERGY POOLS — PICK ONE';
-  document.getElementById('pools-row').innerHTML=GS.pools.map((pool,i)=>{
+  document.getElementById('pools-row').innerHTML=(GS.pools||[]).map((pool,i)=>{
     if(!pool)return`<div class="pool-card used"><span style="font-size:9px;letter-spacing:2px;color:var(--textDim)">TAKEN</span></div>`;
-    const pg=pool.map(o=>`<div class="pool-gem" style="background:${OC[o]}18;color:${OC[o]};border-color:${OC[o]}44;">${OA[o]}</div>`).join('');
+    const safePool=Array.isArray(pool)?pool:Object.values(pool);
+    const pg=safePool.map(o=>`<div class="pool-gem" style="background:${OC[o]}18;color:${OC[o]};border-color:${OC[o]}44;">${OA[o]}</div>`).join('');
     return`<div class="pool-card ${poolsLocked?'locked':''}" onclick="playerPickPool(${i})">
       <div class="pool-gems">${pg}</div><div class="pool-name">Pool ${i+1}</div>
     </div>`;
@@ -3871,6 +3874,7 @@ async function mpConfirmTeam(){
 // ── Battle: Host Initialization ───────────────────────────────────────
 
 async function mpHostInitBattle(hostTeamIds,guestTeamIds){
+  console.log('[MP] Host: mpHostInitBattle called');
   mpCleanup();
   const hostFirst=Math.random()<0.5;
   GS={
@@ -3895,8 +3899,11 @@ async function mpHostInitBattle(hostTeamIds,guestTeamIds){
     stateVer:0,state:mpSerializeGS(),
   };
   // Write battle data FIRST, then signal guest by updating status
+  console.log('[MP] Host: writing battle data to Firebase...');
   await MP.battleRef.set(initBattle);
+  console.log('[MP] Host: battle data written, signaling guest...');
   await MP.roomRef.update({status:'battle'});
+  console.log('[MP] Host: status set to battle');
 
   showScreen('battle');
   mpUpdateBattleHeader();
@@ -3927,13 +3934,13 @@ function mpHostBothPoolsPicked(d){
   // Only run once
   if(GS.phase==='acting'||GS.phase==='waiting-mp-act')return;
   // Assign host pool energy
-  const hPool=d.pools[d.hostPoolPick];
-  if(hPool)hPool.forEach(o=>{GS.pEnergy[o]=(GS.pEnergy[o]||0)+1;});
-  // Assign guest pool energy
-  const gPool=d.pools[d.guestPoolPick];
-  if(gPool)gPool.forEach(o=>{GS.aEnergy[o]=(GS.aEnergy[o]||0)+1;});
+  const allPools=fbArr(d.pools).map(p=>p?fbArr(p):null);
+  const hPool=allPools[d.hostPoolPick]||[];
+  hPool.forEach(o=>{GS.pEnergy[o]=(GS.pEnergy[o]||0)+1;});
+  const gPool=allPools[d.guestPoolPick]||[];
+  gPool.forEach(o=>{GS.aEnergy[o]=(GS.aEnergy[o]||0)+1;});
   addLog(MP.oppName+' picks energy.','e');
-  GS.pools=d.pools.map((_,i)=>i===d.hostPoolPick||i===d.guestPoolPick?null:_);
+  GS.pools=allPools.map((p,i)=>i===d.hostPoolPick||i===d.guestPoolPick?null:fbArr(p));
   GS.phase='acting';
   GS.actionQueue=[];GS.staging=null;
   mpHideWaitBanner();
@@ -4052,7 +4059,18 @@ async function mpHostEndGame(winner){
 
 // ── Battle: Guest ─────────────────────────────────────────────────────
 
+
+// Firebase returns arrays as objects {0:{},1:{},2:{}} — this converts them back safely
+function fbArr(x){if(!x)return[];if(Array.isArray(x))return x;return Object.values(x);}
+function fbCharFromFB(c){
+  return{
+    ...c,
+    statuses:fbArr(c.statuses).map(s=>({...s})),
+    cooldowns:{...(c.cooldowns||{})},
+  };
+}
 function mpGuestWatchBattle(){
+  console.log('[MP] Guest: mpGuestWatchBattle called, room='+MP.roomCode);
   mpCleanup();
   GS={
     turn:1,playerFirst:false,playerGetsFreePick:false,
@@ -4074,6 +4092,7 @@ function mpGuestWatchBattle(){
 }
 
 function mpGuestHandleUpdate(d){
+  console.log('[MP] Guest: update received, phase='+(d&&d.phase)+' hasState='+!!(d&&d.state));
   if(!d){return;}
   if(!d.state){
     // State not ready yet — show connecting message and wait
@@ -4085,14 +4104,17 @@ function mpGuestHandleUpdate(d){
   if(s.winner==='guest'){mpCleanup();endGame('player');return;}
 
   // Apply state — guest sees aTeam as pTeam (their team at bottom)
-  GS.pTeam=s.aTeam.map(c=>({...c,statuses:c.statuses.map(x=>({...x})),cooldowns:{...c.cooldowns}}));
-  GS.aTeam=s.pTeam.map(c=>({...c,statuses:c.statuses.map(x=>({...x})),cooldowns:{...c.cooldowns}}));
+  // fbArr/fbCharFromFB: Firebase stores arrays as objects, convert back
+  try{
+    GS.pTeam=fbArr(s.aTeam).map(fbCharFromFB);
+    GS.aTeam=fbArr(s.pTeam).map(fbCharFromFB);
+  }catch(e){console.error('[MP] team parse error',e,s);return;}
   GS.pEnergy={...s.aEnergy};GS.aEnergy={...s.pEnergy};
-  GS.pFallen=s.aFallen;GS.aFallen=s.pFallen;
+  GS.pFallen=s.aFallen||0;GS.aFallen=s.pFallen||0;
   GS.turn=s.turn||d.turn||GS.turn;
-  GS.log=[...(s.log||[])];
-  GS.playerFirst=!d.hostFirst; // guest has initiative when host doesn't
-  GS.pools=d.pools||[];
+  GS.log=fbArr(s.log||[]);
+  GS.playerFirst=!d.hostFirst;
+  GS.pools=fbArr(d.pools||[]).map(p=>p?fbArr(p):null);
   GS.veteransInstinctUsed={...(s.veteransInstinctUsed||{})};
   GS.overclockUses={...(s.overclockUses||{})};
   GS.lastAbilUsed={...(s.lastAbilUsed||{})};
@@ -4105,7 +4127,7 @@ function mpGuestHandleUpdate(d){
         mpShowWaitBanner('⏳ Waiting for '+MP.oppName+'...');
       }else{
         GS.phase='pool-select';
-        GS.pools=d.pools;
+        GS.pools=fbArr(d.pools).map(p=>p?fbArr(p):null);
         mpHideWaitBanner();
       }
       break;
