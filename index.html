@@ -3893,7 +3893,7 @@ async function mpHostInitBattle(hostTeamIds,guestTeamIds){
   const initBattle={
     turn:1,hostFirst,phase:'pool-pick',
     pools:GS.pools,
-    hostPoolPick:null,guestPoolPick:null,
+    hostPoolPick:-1,guestPoolPick:-1,
     hostActionReady:false,guestActionReady:false,
     hostAction:null,guestAction:null,
     stateVer:0,state:mpSerializeGS(),
@@ -3919,7 +3919,7 @@ function mpHostListenBattle(){
   mpListen(MP.battleRef,'value',snap=>{
     const d=snap.val();if(!d)return;
     // Handle guest pool pick
-    if(d.phase==='pool-pick'&&d.guestPoolPick!==null&&d.hostPoolPick!==null){
+    if(d.phase==='pool-pick'&&d.guestPoolPick>=0&&d.hostPoolPick>=0){
       mpHostBothPoolsPicked(d);
     }
     // Handle guest acting
@@ -3940,7 +3940,7 @@ function mpHostBothPoolsPicked(d){
   const gPool=allPools[d.guestPoolPick]||[];
   gPool.forEach(o=>{GS.aEnergy[o]=(GS.aEnergy[o]||0)+1;});
   addLog(MP.oppName+' picks energy.','e');
-  GS.pools=allPools.map((p,i)=>i===d.hostPoolPick||i===d.guestPoolPick?null:fbArr(p));
+  GS.pools=allPools.map((p,i)=>(i===d.hostPoolPick||i===d.guestPoolPick)?null:fbArr(p));
   GS.phase='acting';
   GS.actionQueue=[];GS.staging=null;
   mpHideWaitBanner();
@@ -4036,7 +4036,7 @@ async function mpHostStartNextRound(){
   const newRound={
     turn:GS.turn,hostFirst:GS.playerFirst,phase:'pool-pick',
     pools:GS.pools,
-    hostPoolPick:null,guestPoolPick:null,
+    hostPoolPick:-1,guestPoolPick:-1,
     hostActionReady:false,guestActionReady:false,
     hostAction:null,guestAction:null,
     stateVer:(Date.now()),state:mpSerializeGS(),
@@ -4121,7 +4121,7 @@ function mpGuestHandleUpdate(d){
 
   switch(d.phase){
     case'pool-pick':
-      if(d.guestPoolPick!==null){
+      if(d.guestPoolPick>=0){
         // Guest already picked, waiting for host or for both
         GS.phase='waiting-mp';
         mpShowWaitBanner('⏳ Waiting for '+MP.oppName+'...');
